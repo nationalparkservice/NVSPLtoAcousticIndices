@@ -1,0 +1,614 @@
+#CALCULATE A SUITE OF ACOUSTIC INDICES for a directory of NVSPL files
+# the indices are calculated over a set time duration set by the user (timestep)
+# this version simply starts at the start of your recordings on a given day
+
+rm(list=ls())
+
+## -------------------------------------------------------------------------
+library(ineq)    #needed for the Gini funtion
+library(vegan)   #needed for diversity
+library(moments) #needed for kurtosis and skewness
+library(NbClust) #needed for clutering
+library(svDialogs)
+
+## -------------------------------------------------------------------------
+#INPUT PARAMETERS
+params = dlgOpen(title = "choose parameters file: paramsFileAcousticIndex_project_instrum")$res
+load(params)
+
+## -------------------------------------------------------------------------
+#FUNCTIONS
+normdBA <- function (x) { (x-(-10)) / (80 - (-10)) } 
+
+## -------------------------------------------------------------------------
+#RUN LOOPs through sites (ss) then days (dys) within a site to calculate acoustic indices, background values
+
+for (ss in 1:length(mySites)  ) # ss = 1
+{
+  
+  OUTPUT_sites  = NULL
+  OUTPUT_sitesD = NULL
+  
+  siteFiles = nvsplFiles[grepl(paste("NVSPL_",mySites[ss],"_",sep=""), basename(nvsplFiles) )]
+  siteDays  = sort(unique(gsub("NVSPL_.+_(\\d{4}_\\d{2}_\\d{2})_\\d{2}.txt","\\1",basename(siteFiles))))
+  
+  #FORMAT matrices and data
+  uDayIndex = (unique(siteDays))
+  acis  = NULL
+  acisD = NULL
+  
+  # start on a specified day
+  if (startday == 1) { startday = uDayIndex[1]} # start on first day
+  dindx = grep(startday, uDayIndex)
+  
+  for ( dd in dindx:length(uDayIndex)) #START loop through unique site days # dd = 1
+  {
+    
+    cat('Calculating Acoustic Index for site: ', mySites[ss], " (", ss,' of ',length(mySites),') for file ', dd,' of ',
+        length(uDayIndex), " [", uDayIndex[dd], "]", '\n',sep="")
+    
+    #GET files for a given day
+    dy = siteDays[dd]
+    siteDayFiles = siteFiles[grepl(dy,basename(siteFiles))]
+    
+    #GET DATA IN THE RIGHT FORMAT
+    dayMatrix    = NULL
+    for(sf in siteDayFiles) {
+      
+      myTempMatrix = read.csv(sf)
+      timeData = matrix(as.numeric(unlist( strsplit( gsub(":"," ",substr(gsub('-',' ',as.character(myTempMatrix[,2])),0,19)),' ')) ),ncol=6, byrow=T )
+      myTempMatrix = cbind(timeData, myTempMatrix[,3:45] )
+      colnames(myTempMatrix)[1:6] = c("Yr","Mo", "Day", "Hr", "Min", "Sec")
+      dayMatrix = rbind(dayMatrix, myTempMatrix)
+      
+      #REVIEW spectrogram of the 1 hr file if desired
+      if (plt == 1)
+      {
+        myTempMatrixPLT <- cbind(timeData, myTempMatrix[,3:45] )
+        site <- gsub('.txt', '', as.character(basename(sf)) )
+        colnames(myTempMatrixPLT)[1:6] <- c("Yr","Mo", "Day", "Hr", "Min", "Sec")
+        dayMatrix2 <-  myTempMatrixPLT
+        
+        plotSecs <- timeData[,5] * 60 + timeData[,6]
+        plotFreqs <- grep("H\\d",colnames(dayMatrix2),value=T)
+        image(plotSecs,1:length(plotFreqs),
+              as.matrix(dayMatrix2[,plotFreqs]),
+              col=colorRampPalette(c("blue","orange","white"))(100),
+              xlab="Time (s)",ylab = "Freq Idx",
+              zlim=c(-8,85))
+        #locator() #allows you to pick points on the image
+      }
+    }
+    rm(myTempMatrix)
+    
+    #TRUNCATE by time of day (for calculating around sunrise)
+    if (sunrise == 1) {
+      ind <- match(mySites[ss],siteloc$ID,nomatch = NA)
+      Lat <- siteloc$Latitude[ind]
+      Lon <- siteloc$Longitude[ind]
+      jDay <- as.numeric(format(as.POSIXct(dy, format="%Y_%m_%d"),"%j"))
+      estsun = suncalc(jDay,Lat,Lon)
+      s1 = unlist(strsplit(as.character(estsun[1]), "[.]") )
+      shr = as.numeric(s1[1])
+      dayMatrix <- cbind(dayMatrix[,"Hr"] + (60 * dayMatrix[,"Min"] + dayMatrix[,"Sec"])/3600, dayMatrix)
+      colnames(dayMatrix)[1] <- "decHr"
+      
+      dayMatrix <- dayMatrix[dayMatrix[,"decHr"] > (estsun$sunrise - 1) & dayMatrix[,"decHr"] < (estsun$sunrise + 2),-1]
+    }
+    
+    #CHECK to see if full minutes are included, remove any non-full minutes
+    test    = do.call(paste, c(dayMatrix[c("Hr", "Min")], sep = "_"))
+    unHrMin = unique(test)
+    dayMatrix = cbind(dayMatrix,test)
+    
+    #REMOVE rows with NAs (e.g. unique( dayMatrix$dbA ) )
+    dayMatrix = dayMatrix[!is.na(dayMatrix$dbA),]
+    
+    #REMOVE DUPLICATE TIMES
+    #noticed that sometimes if a day is slit over multiple audio files, you can get repeated rows... need to remove dublicate rows before segmenting by timestep
+    test2    = do.call(paste, c(dayMatrix[c("Hr", "Min","Sec")], sep = "_"))
+    dayMatrix = cbind(dayMatrix,test2)
+    dayMatrix = dayMatrix[!duplicated(dayMatrix$test2),]
+    
+    #A-weight 33 octave bands in dayMatrix
+    FREQ = colnames(dayMatrix[7:(33+6)])
+    aweight <- ( c(-63.4,-56.7,-50.5,-44.7, -39.4, -34.6, -30.2, -26.2, -22.5, - 19.1, -16.1,
+                   -13.4, -10.9, -8.6, -6.6, -4.2, -3.2, -1.9, -0.8, 0, 0.6, 1, 1.2,
+                   1.3, 1.2, 1.0, 0.5, -0.1, -1.1, -2.5, -4.3, -6.6, -9.3) )
+    dayMatrix33 =  dayMatrix[    which( colnames(dayMatrix)==FREQ[1] ):
+                                   which( colnames(dayMatrix)==FREQ[33]) ]
+    dayMatrix33A = t( t(dayMatrix33) + aweight)
+    dayMatrix33A = cbind(dayMatrix[,1:6],dayMatrix33A)
+    
+    #........................................................................................
+    ## RUN acoustic indicies on each "Timestep"
+    #........................................................................................
+    #SUBSET so sampling starts at the beginning of data for a given day
+    
+    Output  =NULL
+    Output1 =NULL
+    BKADI   =NULL
+    
+    for(i in ( seq(from  = 1, to =  dim(dayMatrix)[1], by = (Timestep*60)) ) ) 
+    {
+      
+      # unweighted matrix
+      workingMatrix = dayMatrix[i:(i+((Timestep*60)-1)),]
+      # CHECK: cat(i,": ", "start:", workingMatrix[1,5], ":",workingMatrix[1,6], "(", dim(workingMatrix)[1],")\n")
+      # Inf values are a problem in calculations, so need to remove...
+      idx= NULL
+      for (mm in 1: dim(workingMatrix)[1] ) {
+        test = !is.infinite( unlist(workingMatrix[mm,]) )
+        if( all(test) == FALSE  )  {
+          #cat("this works!") 
+          idx = c(idx,mm)   
+        } }
+      if (!is.null(idx)) {   workingMatrix = workingMatrix[-idx,]  }
+      workingMatrix= workingMatrix[rowSums(is.na(workingMatrix)) != ncol(workingMatrix), ]
+      
+      # A-weighted matrix
+      workingMatrixA = dayMatrix33A[i:(i+((Timestep*60)-1)),]  
+      # Inf values are a problem in calculations, so need to remove
+      idx= NULL
+      for (mm in 1: dim(workingMatrixA)[1] ) {
+        test = !is.infinite( unlist(workingMatrixA[mm,]) )
+        if( all(test) == FALSE  )  {
+          #cat("this works!") 
+          idx = c(idx,mm)   
+        } }
+      
+      if (!is.null(idx)) {   workingMatrixA = workingMatrixA[-idx,]  }
+      workingMatrixA= workingMatrixA[rowSums(is.na(workingMatrixA)) != ncol(workingMatrixA), ]
+      
+      dayMatrixlim =  NULL
+      BKdayMatrixlimA = NULL
+      BKdayMatrixlim =  NULL
+      dayMatrixlimA =  NULL
+    
+      if( dim(workingMatrix)[1] >= (Timestep * 60) - 60 )
+      {
+        #TRUNCATE matrix in frequency bands of interest
+        dayMatrixlim =   workingMatrix[which( colnames(workingMatrix)==fminimum ):which( colnames(workingMatrix)==fmaximum) ]
+        BKdayMatrixlim = workingMatrix[which( colnames(workingMatrix)== BKfminimum ):which( colnames(workingMatrix)== BKfmaximum) ]
+        dayMatrixlimA =  workingMatrixA[which( colnames(workingMatrixA)== fminimum ):which( colnames(workingMatrixA)== fmaximum) ]
+        BKdayMatrixlimA= workingMatrixA[which( colnames(workingMatrixA)== BKfminimum ):which( colnames(workingMatrixA)== BKfmaximum) ]
+        #Number of frequency bands
+        nFQ = as.numeric( dim(dayMatrixlim) [2] )
+        nFQbk =  as.numeric( dim(BKdayMatrixlim) [2] )
+        #Number of seconds
+        fileDur = as.numeric( dim(dayMatrixlim) [1] )
+        
+        #........................................................................................
+        # CALCULATE per-frequency metrics- need in other indices (NOT SAVED!)
+        #........................................................................................
+        #(1) simple average backtound noise estimate for each 1/3 octave band
+        BKBirddB <- 10*log10( colMeans( 10^(dayMatrixlim/10) ) )
+        ## NOTE: how to report these values: 
+        # will not report- this is what you used for background noise estimate in the frequency band of the ADI
+        # how you calculated these values:
+        # In each timestep (10 min) for each 1/3 octave frequency band of interest (fminimum -fmaxium), 
+        # 1) converted to pressures, 2) calcuted the mean pressure for each frequency band, and 3) converted back to dB
+        
+        # (2) Background noise from #2 in Towsey, modified here as a level for each frequency band, not normalized!
+        BK_Towsey <- NULL
+        for (ff in 1:length(dayMatrixlim) ) { #loop through each frequency band 
+          #(1) compute a histogram of lowest dB values, with a length equal to 1/8th of total values
+          tmp <- sort ( dayMatrixlim[,ff]) [ 1:( dim(dayMatrixlim)[1] /8) ]
+          #(2) smooth the histogram with moving average- did not do!!!
+          #!!!!! check this: filter(tmp,rep(1,5),method = "convolution")
+          #(3) find bin with the maximum count
+          tmp1 <- c(table(tmp)) #count for each dB bin
+          tmpval <- as.numeric( (tmp1)) #counts for each bin as, numeric
+          tmpnam <- as.numeric(names(tmp1)) #dB value for each bin, numeric
+          tmpc <- as.matrix( cbind(tmpnam,tmpval))
+          colmax <- as.numeric(which.max(tmpval))
+          #(4) accumulating counts in histogram bins below (3) until 68% of counts below (3) is reached
+          cutoff = sum( tmpval[ 1:colmax-1] ) * .68 #value to stop the summation at
+          # got an error when the first bin had the max # of values..... so just  use the min value
+          if (cutoff == 0) {stploc = 0}
+          cntbk <- 0
+          for (h in 1:length(tmpval[1:colmax])-1 )
+          {
+            if (cntbk > cutoff) {
+              break }
+            loc = colmax - h #find the location to start the summation
+            cntbk = cntbk + tmpval[loc]
+            stploc = tmpnam[loc-1]
+          }
+          # (5) final calc: (3) + N(4)
+          if (cutoff == 0) {BK_Towsey[ff] = tmpnam[colmax] } else { BK_Towsey[ff] = tmpnam[colmax] + stploc*0.1 }
+        }
+        
+        
+        BK_Towsey_anth<- NULL
+        for (ff in 1:length(BKdayMatrixlim) ) { #loop through each frequency band 
+          #(1) compute a histogram of lowest dB values, with a length equal to 1/8th of total values
+          tmp <- sort ( BKdayMatrixlim[,ff]) [ 1:( dim(BKdayMatrixlim)[1] /8) ]
+          #(2) smooth the histogram with moving average- did not do!!!
+          #!!!!! check this: filter(tmp,rep(1,5),method = "convolution")
+          #(3) find bin with the maximum count
+          tmp1 <- c(table(tmp)) #count for each dB bin
+          tmpval <- as.numeric( (tmp1)) #counts for each bin as, numeric
+          tmpnam <- as.numeric(names(tmp1)) #dB value for each bin, numeric
+          tmpc <- as.matrix( cbind(tmpnam,tmpval))
+          colmax <- as.numeric(which.max(tmpval))
+          #(4) accumulating counts in histogram bins below (3) until 68% of counts below (3) is reached
+          cutoff = sum( tmpval[ 1:colmax-1] ) * .68 #value to stop the summation at
+          # got an error when the first bin had the max # of values..... so just  use the min value
+          if (cutoff == 0) {stploc = 0}
+          cntbk <- 0
+          for (h in 1:length(tmpval[1:colmax])-1 )
+          {
+            if (cntbk > cutoff) {
+              break }
+            loc = colmax - h #find the location to start the summation
+            cntbk = cntbk + tmpval[loc]
+            stploc = tmpnam[loc-1]
+          }
+          # (5) final calc: (3) + N(4)
+          if (cutoff == 0) {BK_Towsey_anth[ff] = tmpnam[colmax] } else { BK_Towsey_anth[ff] = tmpnam[colmax] + stploc*0.1 }
+        }
+        
+        
+        # (3) Exceedence levels by frequency band (not normalized!)
+        exceed = NULL
+        for (iy in 1:dim(dayMatrixlim)[2]) { 
+          tmp <- quantile(dayMatrixlim[,iy], c(0.05, 0.1, 0.5, 0.9, 0.95), na.rm = TRUE) 
+          exceed = cbind(exceed,tmp)      }
+        colnames(exceed) <- colnames(dayMatrixlim)
+        L10 = (exceed[4,]) #L10 = 90th percentile
+        L90 = (exceed[2,]) #L90 = 10th percentile
+        difexceed = L10 - L90
+        #........................................................................................
+        
+        #........................................................................................
+        #START ACOUSTIC INDEX CALCULATIONS
+        #........................................................................................
+        ## (1a) CALCULATE ACI- SPLs
+        t <- array(0, dim(dayMatrixlim) - c(1,0))
+        for (frq in 1:(dim(t)[2])) # loop through frequency bands
+        {
+          t[,frq] <- abs( diff(dayMatrixlim[,frq]) )/ sum(dayMatrixlim[,frq])
+        }
+        ACIout = sum(t)# ACI results for each time chunck on a given day
+        rm(t)
+        
+        ## (1b) CALCULATE ACI- intensity (unlog)
+        dayMatrixlimI = 10^(dayMatrixlim/10) # convert to pressure
+        t <- array(0, dim(dayMatrixlimI) - c(1,0))
+        for (frq in 1:(dim(t)[2])) # loop through frequency bands
+        {
+          t[,frq] <- abs( diff(dayMatrixlimI[,frq]) )/ sum(dayMatrixlimI[,frq])
+        }
+        ACIoutI = sum(t)# ACI results for each time chunck on a given day
+        rm(t)
+        
+        ## (1b) CALCULATE ACI- normalized
+        dayMatrixlimN = normdBA(dayMatrixlim)
+        t <- array(0, dim(dayMatrixlimN) - c(1,0))
+        for (frq in 1:(dim(t)[2])) # loop through frequency bands
+        {
+          t[,frq] <- abs( diff(dayMatrixlimN[,frq]) )/ sum(dayMatrixlimN[,frq])
+        }
+        ACIoutN = sum(t)# ACI results for each time chunck on a given day
+        rm(t)
+        #........................................................................................
+        
+        #........................................................................................
+        ## (2,3,4,5) CALCULATE background noise SPL for timestep, gives 1 Timestep background dB value
+        #A-weight the BK values
+        BKdBA_low = 10*log10( sum( 10^(BKdayMatrixlimA/10))/ (Timestep*60)) 
+        BKdBA_bird = 10*log10( sum( 10^(dayMatrixlimA/10))/ (Timestep*60) )
+        #unweight values
+        BKdB_low  = 10*log10( sum( 10^(BKdayMatrixlim/10))/ (Timestep*60)) 
+        BKdB_bird = 10*log10( sum( 10^(dayMatrixlim/10))/ (Timestep*60) )
+        ## NOTE: how to REPORT these values: 
+        # xx dB re:1 uPa (BKfminimum Hz- BKfminimum Hz)
+        # how you calculated these values:
+        # In each timestep (10 min) over the frequency band of interest, 
+        # 1) converted to pressures, 2) calcuted the mean pressure, and 3) converted back to dB
+        #........................................................................................
+        
+        #........................................................................................
+        ## (6,7) Average signal amplitude- #1 in Towsey et al., 2013
+        #modified as the mean dBA value for the timestep, normalized by the min/max (set at: -10 to 80 dB)
+        avgAMP = normdBA(mean     (workingMatrix$dbA)     )
+        L10AMP = normdBA(quantile (workingMatrix$dbA, .1) ) #10th percentile = L90
+        #........................................................................................
+        
+        #........................................................................................
+        ## (8,9,10) Spectal Entrophy (#10 in Towsey), Temporal entropy (#7 in Towsey), Entropy Index
+        Pres = colMeans(10^(dayMatrixlim/10))  #Leq for each Fq band over time period (mean of the pressures)
+        Pres2 = Pres/sum(Pres)
+        Hf = -sum( (Pres2 * log(Pres2))) /log(nFQ)
+        Leqt = ( rowMeans( (10^(dayMatrixlim/10)) ) ) #Leq for each second over entire band (could also used dBA)
+        Leqt2 = Leqt/sum(Leqt)
+        Ht = -sum( (Leqt2 * log(Leqt2)) / log(fileDur) ) 
+        EI = Ht * Hf
+        #........................................................................................
+        
+        #........................................................................................
+        ## (11,12,13,14) Biophony, Anthrophony, normalised difference in soundscape, ratio of A/B
+        BioPh = sum( colMeans(10^(dayMatrixlim/10)) )
+        AthPh = sum( colMeans(10^(BKdayMatrixlim/10)) )
+        SoundScapeI = (BioPh -AthPh ) / (BioPh + AthPh )
+        Bio_anth = (BioPh /AthPh ) 
+        #........................................................................................
+        
+        #........................................................................................
+        ## (15,16,17) acoustic activity, count of acoustic events, duration of acoustic events
+        AA = NULL
+        AAc = NULL
+        s2n <- NULL
+        for (f in 1:length(dayMatrixlim) ) {
+          AA[f] =  length( dayMatrixlim[,f][ dayMatrixlim[,f] > BK_Towsey[f]+3 ] )/ length (dayMatrixlim[,f])
+          AAc[f] = length( dayMatrixlim[,f][ dayMatrixlim[,f] > BK_Towsey[f]+3 ] )
+          s2n[f] = max((dayMatrixlim[,f])) - BK_Towsey[f]
+        }
+        AA= sum(AA)
+        AAc = sum(AAc)
+        AAdur = NULL
+        for (f in 1:length(dayMatrixlim) ) {
+          #logical matrix...
+          temp <- dayMatrixlim[,f] > BK_Towsey[f]+3 
+          #table(temp)["TRUE"] ; table(temp)["FALSE"]
+          temp2 <- temp*1 # convert to 0/1
+          #find consecutive 1 values...
+          rl <- rle(temp2)
+          len = rl$lengths
+          v =  rl$value
+          if (length(v) == 1 )
+          {
+            if   (v == 0) {AAdur[f] = 0 }
+            else {AAdur[f] = len }
+            next
+          }
+          cumsum = NULL
+          cntAA = 0
+          for ( qq in  seq(from = 2, to = length(v), by =2) ) 
+          {
+            cntAA = cntAA +1
+            cumsum[cntAA] = len[qq]
+          }
+          AAdur[f] = mean(cumsum)
+        }
+        AAdur = median(AAdur)
+        
+        #........................................................................................
+        ## (15,16,17) acoustic activity, count of acoustic events, duration of acoustic events for NOISE
+        AAanth = NULL
+        AAcanth = NULL
+        s2nanth <- NULL
+        AAduranth = NULL
+        
+        for (f in 1:length(BKdayMatrixlim) ) {
+          AAanth[f] =  length( BKdayMatrixlim[,f][ BKdayMatrixlim[,f] > BK_Towsey_anth[f]+3 ] )/ length (BKdayMatrixlim[,f])
+          AAcanth[f] = length( BKdayMatrixlim[,f][ BKdayMatrixlim[,f] > BK_Towsey_anth[f]+3 ] )
+          s2nanth[f] = max((BKdayMatrixlim[,f])) - BK_Towsey_anth[f]
+        }
+        
+        AAanth= sum(AAanth)
+        AAcanth = sum(AAcanth)
+        
+        for (f in 1:length(BKdayMatrixlim) ) {
+          #logical matrix...
+          temp <- BKdayMatrixlim[,f] > BK_Towsey_anth[f]+3 
+          #table(temp)["TRUE"] ; table(temp)["FALSE"]
+          temp2 <- temp*1 # convert to 0/1
+          #find consecutive 1 values...
+          rl <- rle(temp2)
+          len = rl$lengths
+          v =  rl$value
+          if (length(v) == 1 )
+          {
+            if   (v == 0) {AAduranth[f] = 0 }
+            else {AAduranth[f] = len }
+            next
+          }
+          cumsum = NULL
+          cntAA = 0
+          for ( qq in  seq(from = 2, to = length(v), by =2) ) 
+          {
+            cntAA = cntAA +1
+            cumsum[cntAA] = len[qq]
+          }
+          AAduranth[f] = mean(cumsum)
+        }
+        
+        AAduranth = median(AAduranth)
+        
+        #........................................................................................
+        
+        #........................................................................................
+        ## (18) Roughness
+        Rough = NULL
+        for (f in 1:length(dayMatrixlim) ){
+          x = dayMatrixlim[,f]
+          x <- x/max(x)
+          deriv2 <- diff(x, 1, 2)
+          Rough[f] <- sum(deriv2^2, na.rm = TRUE)
+        }  
+        Rough = median(Rough)
+        #........................................................................................
+        
+        #........................................................................................
+        ## (19,20) Acoustic diversity, acoustic eveness
+        Score = NULL
+        for (f in 1:length(dayMatrixlim) ) 
+        {
+          Score[f] = length( dayMatrixlim[,f][dayMatrixlim[,f] > BK_Towsey[f]+3] )/ length (dayMatrixlim[,f])
+        }
+        ADI_step = diversity(Score, index = "shannon")
+        Eveness_step = Gini(Score)
+        #........................................................................................
+        
+        #........................................................................................
+        ## (21,22,23,24,25,26) frequency with max amplitude, total count of max for each freq band (normalized by total bands),
+        # kurtosis, skewness, entrophy of spectral max, entrophy of spectral variance)
+        # peak frequency
+        peakf = NULL
+        for (j in 1:dim(dayMatrixlim)[1] ) 
+        {   peakf[j] = (which.max( dayMatrixlim[j,] ) )  }
+        pk2 = matrix(0,1,dim(dayMatrixlim)[2])
+        for (uu in 1:nFQ)  { pk2[uu] = sum(peakf == uu)  }
+        colnames(pk2) = colnames(dayMatrixlim)
+        pk2nor = pk2/fileDur
+        pk = as.numeric ( gsub("H","",colnames(dayMatrixlim[which.max(pk2)]) ) )
+        
+        # kurtosis- is the shape of peak frequencies normally distributed (kurtosis) ?
+        pkd = kurtosis( as.vector(pk2nor) )
+        
+        # skewness- What is the skewness is this distribution? (symmetrical = 0, right skew = +)
+        pks = skewness(as.vector(pk2nor))
+        
+        # entropy of Spectral Maxima
+        pk2[pk2 == 0] <- 1e-07
+        pk_prob = pk2/(sum(pk2)) # normalize
+        Hm = -sum( (pk_prob * log2(pk_prob) ) )/log2(nFQ)
+        
+        # entropy of spectral variance- pressure and dB
+        Press = (10^(dayMatrixlim/10)) #conver back to pressure
+        Pv = NULL
+        for (v in 1:dim(Press)[2] ) {Pv[v] = var(Press[,v]) }
+        Pv2 = Pv/sum(Pv)
+        HvPres = -sum( (Pv2 * log2(Pv2)) ) / log2(nFQ)
+        
+        Pv = NULL
+        for (v in 1:dim(dayMatrixlim)[2] ) {Pv[v] = var(dayMatrixlim[,v]) }
+        Pv2 = Pv/sum(Pv)
+        HvSPL = -sum( (Pv2 * log2(Pv2)) ) / log2(nFQ)
+        #........................................................................................
+        
+        #........................................................................................
+        ## (27) Normalize exceedence levels for dBA
+        Exceed_norm    = normdBA ( quantile(workingMatrix$dbA, c(0.05, 0.1, 0.5, 0.9, 0.95),na.rm = TRUE) )
+        L10n = (Exceed_norm[4]) #L10 = 90th percentile
+        L90n = (Exceed_norm[2]) #L90 = 10th percentile
+        dif_L10L90 = L10n - L90n
+        #........................................................................................
+        
+        #........................................................................................
+        ## (28) Acoustic Richness- calculate temoral entropy and median broadband SPL for each minute and ranks results
+        Mamp = quantile( 10*log10( ( rowMeans( (10^(dayMatrixlim/10)) ) ) ), 0.5)
+        
+        #........................................................................................
+        ## (29) Spectral diversity (Sd)- determine optimal number of clusters for the timestep and how confident/explained
+        # http://www.sthda.com/english/wiki/determining-the-optimal-number-of-clusters-3-must-known-methods-unsupervised-machine-learning
+        # http://www.sthda.com/english/wiki/determining-the-optimal-number-of-clusters-3-must-known-methods-unsupervised-machine-learning
+        
+        x = scale(dayMatrixlim)  # To standarize the variables
+        #get an error when NAN are present in x- not sure why it creates NAN- can I just skip these time steps?
+        
+        res = NbClust(x, distance = "euclidean", min.nc=2, max.nc=10, method = "kmeans", index = "silhouette")
+        # use all algothrums to find optimal cluster... takes way to long!
+        #res = NbClust(x, distance = "euclidean", min.nc=2, max.nc=(dim(x)[1])/60, method = "ward.D", index = "all")
+        # use "gap" method (Tibshirani et al. 2001) Smallest n_{c} such that criticalValue >= 0
+        #res = NbClust(x, distance = "euclidean", min.nc=2, max.nc=(dim(x)[1])/60, method = "ward.D", index = "gap")
+        # Euclidean distance : Usual square distance between the two vectors (2 norm).  d(x,y)= (sum_{j=1}^{d} (x_j - y_j)^2)^(1/2)
+        # Ward method minimizes the total within-cluster variance. At each step the pair of clusters with minimum cluster distance are merged. To implement this method, at each step find the pair of clusters that leads to minimum increase in total within-cluster variance after merging. Two different algorithms are found in the literature for Ward clustering. The one used by option "ward.D" (equivalent to the only Ward option "ward" in R versions <= 3.0.3) does not implement Ward's (1963) clustering criterion, whereas option "ward.D2" implements that criterion (Murtagh and Legendre 2013). With the latter, the dissimilarities are squared before cluster updating.
+        # fviz_nbclust(x, pam, method = "gap") # to visualize the results
+        
+        #res$All.index
+        #res$All.CriticalValues
+        x2 =  as.data.frame(t(res$Best.nc))
+        x4 = (table(x2$Number_clusters))
+        NumCL =  as.numeric(names(which.max(x4))) # "R"
+        
+        #........................................................................................
+        # (30) Spectral persistence
+        #........................................................................................
+        BP = as.numeric(res$Best.partition)
+        BPrle <- rle(BP)# need to find how many seconds each cluster "persisted" for
+        # average duration of the clusters which persist for longer than one frame, so don't count 1s!
+        SP2= mean(BPrle$lengths[BPrle$lengths>1])
+        
+        
+        # what is the peak frequency, average broadband SPL, and average duration for each cluster
+        cluster = res$Best.partition
+        tempCL  = cbind(dayMatrixlim,cluster) # adds cluster number to matrix
+        tempCL$max  = apply(tempCL[,1:fbinMax], 1, which.max) # add max SPL column # to the matrix
+        tempCL$pkFq = round(as.numeric ( gsub("H","", colnames(tempCL[tempCL$max] ) ) )) # converts column number to frequency band
+        tempCL$spl =  10*log10 (rowMeans( (10^(tempCL[,1:fbinMax]/10)) ) )
+        cls = unique(res$Best.partition) #unique clusters in this data set
+        CLdets = NULL
+        for (clls in 1:4) {
+          tmpCL = tempCL[tempCL$cluster == cls[clls],]
+          tmpCLdur = (BPrle$lengths[BPrle$values == cls[clls] ] )
+          
+          Cldur = mean(tmpCLdur,rm.na = T) # mean duration of each cluster
+          #Cldur = mean(tmpCLdur[tmpCLdur>1]) # mean duration of each cluster
+          tmpCLpk = table(tmpCL$pkFq)
+          CLpk = as.numeric( rownames( as.data.frame(which.max(tmpCLpk))[1] ) ) # peak frequency
+          if (is.na( tmpCL[1,1])  == T ){ CLpk = NA}
+          CLspl = median(tmpCL$spl)
+          
+          CLdets = cbind(CLdets, cbind(Cldur, CLpk, CLspl) )
+          rm(tmpCL,tmpCLpk, tmpCLdur,Cldur,CLpk, CLspl)
+        }
+        colnames(CLdets) = c("CL1dur", "CL1pk", "CL1Leq","CL2dur", "CL2pk", "CL2Leq","CL3dur", "CL3pk", "CL3Leq","CL4dur", "CL4pk", "CL4Leq")
+        rm(tempCL,cls)
+        
+        #........................................................................................
+        #END  ACOUSTIC INDEX CALCULATIONS
+        #........................................................................................
+        
+        #APPEND to a datasheet with first minute of chunk...
+        Output = rbind(Output, cbind(mySites[ss], siteDays[dd], 
+                                     workingMatrix[1,1:6], Timestep, dim(workingMatrix)[1],
+                                     ACIout, ACIoutI, ACIoutN, BKdB_low, BKdBA_low, BKdB_bird, BKdBA_bird,
+                                     avgAMP, L10AMP, Hf, Ht, EI, BioPh, AthPh, SoundScapeI, Bio_anth,
+                                     AA, AAc, AAdur, AAanth, AAcanth, AAduranth, 
+                                     Rough, ADI_step, Eveness_step,
+                                     pk, pkd, pks, Hm, HvPres, HvSPL, unlist(dif_L10L90), Mamp, NumCL, SP2,CLdets, vers) )
+        
+        BKADI = rbind(BKADI,BKBirddB) # rbind(BKADI,cbind(workingMatrix[1,1:6],BKBirddB))
+        
+        #colnames (site, Day, YY, MM, DD, HH, MM, SS, timestep, #Sec, 
+        #ACI, BKlow_dB, BKlow_dBA, BKbird_dB, BKbird_dBA, 
+        #avg_nom, L10_norm, SpectralEntropy, TemporalEntropy, EntropyIndex, Biophony, Anthrophony, SoundScapeIndex, RatioSoundScapeIndex,
+        # AcousticActivity, AcousticEvents, DurAcousticEvents, Roughness, AcousticDiversity, Eveness)
+        #........................................................................................
+        #some clean up
+        #rm(ACIout, BKdB_low,BKdBA_low, BKdB_bird, BKdBA_bird,BKBirddB)
+        
+      } # else {cat(i," hr ", j, " min NO DATA",'\n',sep="") } 
+      
+    }# end of timestep loop
+    
+    
+    ## append all TIMESTEP data for each day together
+    Output$AR = (rank(Output$Mamp) * rank(Output$Ht))/(length(Output)^2)
+    
+    acis = rbind(acis, Output)
+    
+    #........................................................................................
+    ## RUN acoustic indicies on each DAY- NOT PART OF THIS CODE see version 17!
+    #........................................................................................
+    
+    dayMatrixlim1 =  NULL
+    BKdayMatrixlim1 = NULL
+    BKdayMatrixlimA1 = NULL
+    dayMatrixlimA1 = NULL
+    
+  } # END of loop for DAYS
+  
+  acisD = as.data.frame(acisD)
+  acisD$AR = (rank(acisD$Mamp1)* rank(acisD$HtDay))/(length(acisD)^2)
+  
+  OUTPUT_sites =  rbind(OUTPUT_sites, acis)
+  OUTPUT_sitesD = rbind(OUTPUT_sitesD, acisD)
+  
+  ## WRITE OUT DATA, for each site
+  colnames(OUTPUT_sites)[2]  ="Date"
+  colnames(OUTPUT_sites)[1]  ="Site"
+  colnames(OUTPUT_sites)[10] ="SampleLength_sec"
+  
+  dstmp = Sys.Date()
+  if (savFile == 1) {
+    # TIMESTEP DATA
+    outFileName <- paste0(Outdir, "\\", mySites[ss], "_",Timestep, "mins", "_NVSPL_AcousticIndexStartatBegin_Created", dstmp, ".csv")
+    write.csv(OUTPUT_sites, file=outFileName, na ="NaN", quote=F, row.names=F)
+  }
+  
+} # END of loop for SITES
+
